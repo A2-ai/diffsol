@@ -156,6 +156,7 @@ pub struct Bdf<
     statistics: BdfStatistics,
     state: BdfState<Eqn::V, M>,
     tstop: Option<Eqn::T>,
+    h_before_tstop: Option<Eqn::T>,
     root_finder: Option<RootFinder<Eqn::V>>,
     is_state_modified: bool,
     jacobian_update: JacobianUpdate<Eqn::T>,
@@ -209,6 +210,7 @@ where
             statistics: BdfStatistics::default(),
             state: self.state.clone(),
             tstop: self.tstop,
+            h_before_tstop: self.h_before_tstop,
             root_finder: self.root_finder.clone(),
             is_state_modified: self.is_state_modified,
             jacobian_update: self.jacobian_update.clone(),
@@ -363,6 +365,7 @@ where
             statistics: BdfStatistics::default(),
             state,
             tstop: None,
+            h_before_tstop: None,
             root_finder,
             is_state_modified,
             jacobian_update: JacobianUpdate::new(&problem.ode_options),
@@ -687,6 +690,9 @@ where
             * (abs(state.t) + abs(state.h));
         if abs(state.t - tstop) <= troundoff {
             self.tstop = None;
+            if let Some(h) = self.h_before_tstop.take() {
+                self.restore_step_size_after_tstop(h)?;
+            }
             return Ok(Some(OdeSolverStopReason::TstopReached));
         } else if (state.h > M::T::zero() && tstop < state.t - troundoff)
             || (state.h < M::T::zero() && tstop > state.t + troundoff)
@@ -696,6 +702,7 @@ where
                 state_time: state.t.to_f64().unwrap(),
             };
             self.tstop = None;
+            self.h_before_tstop = None;
 
             return Err(DiffsolError::from(error));
         }
@@ -709,10 +716,21 @@ where
                 tstop.to_f64().unwrap()
             );
             let factor = (tstop - state.t) / state.h;
+            if self.h_before_tstop.is_none() {
+                self.h_before_tstop = Some(state.h);
+            }
             // update step size ignoring the possible "step size too small" error
             let _ = self._update_step_size(factor);
         }
         Ok(None)
+    }
+
+    fn restore_step_size_after_tstop(&mut self, h: Eqn::T) -> Result<(), DiffsolError> {
+        let factor = h / self.state.h;
+        self._update_step_size(factor)?;
+        self.state.dy.copy_from_view(&self.state.diff.column(1));
+        self.state.dy *= scale(Eqn::T::one() / self.state.h);
+        Ok(())
     }
 
     fn initialise_to_first_order(&mut self) {
@@ -1623,7 +1641,7 @@ mod test {
         },
         scale, BdfState, ConstantOp, Context, DenseMatrix, FaerLU, FaerMat, FaerSparseLU,
         FaerSparseMat, MatrixCommon, NalgebraLU, NalgebraVec, OdeBuilder, OdeEquations,
-        OdeSolverMethod, Op, Vector, VectorHost, VectorView,
+        OdeSolverMethod, OdeSolverStopReason, Op, Vector, VectorHost, VectorView,
     };
 
     type M = NalgebraMat<f64>;
@@ -1778,6 +1796,28 @@ mod test {
         assert!(
             split_steps <= single_sweep_steps + 10,
             "checkpoint/restart should preserve BDF step growth state: split={split_steps}, single={single_sweep_steps}"
+        );
+    }
+
+    #[test]
+    fn bdf_tstop_restores_pre_truncation_step_size() {
+        let (problem, _) = exponential_decay_problem::<M>(false);
+        let mut solver = problem.bdf::<LS>().unwrap();
+        let h_before = solver.state().h;
+        let tstop = solver.state().t + h_before / 10.0;
+
+        solver.set_stop_time(tstop).unwrap();
+        loop {
+            if solver.step().unwrap() == OdeSolverStopReason::TstopReached {
+                break;
+            }
+        }
+
+        assert!(
+            solver.state().h > h_before * 0.9,
+            "tstop truncation should not persist as the next proposed step size: before={}, after={}",
+            h_before,
+            solver.state().h
         );
     }
 
