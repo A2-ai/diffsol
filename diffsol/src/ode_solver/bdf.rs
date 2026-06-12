@@ -138,7 +138,6 @@ pub struct Bdf<
     convergence: Convergence<'a, Eqn::V>,
     ode_problem: &'a OdeSolverProblem<Eqn>,
     op: Option<BdfCallable<&'a Eqn>>,
-    n_equal_steps: usize,
     y_delta: Eqn::V,
     g_delta: Eqn::V,
     y_predict: Eqn::V,
@@ -193,7 +192,6 @@ where
             convergence,
             op,
             s_op,
-            n_equal_steps: self.n_equal_steps,
             y_delta: self.y_delta.clone(),
             g_delta: self.g_delta.clone(),
             y_predict: self.y_predict.clone(),
@@ -348,7 +346,6 @@ where
             op,
             ode_problem: problem,
             nonlinear_solver,
-            n_equal_steps: 0,
             diff_tmp,
             gdiff_tmp,
             sgdiff_tmp: M::zeros(0, 0, ctx.clone()),
@@ -501,7 +498,7 @@ where
         //- lu factorisation of (M - c * J) used in newton iteration (same equation)
 
         let new_h = factor * self.state.h;
-        self.n_equal_steps = 0;
+        self.state.n_equal_steps = 0;
 
         // update D using equations in section 3.2 of [1]
         let order = self.state.order;
@@ -719,7 +716,7 @@ where
     }
 
     fn initialise_to_first_order(&mut self) {
-        self.n_equal_steps = 0;
+        self.state.n_equal_steps = 0;
 
         // scale step size h to account for reduction in order at order n error is O(h^{n+2}))
         // error_b = C * h_old^{n+2}
@@ -1468,9 +1465,9 @@ where
 
         // a change in order is only done after running at order k for k + 1 steps
         // (see page 83 of [2])
-        self.n_equal_steps += 1;
+        self.state.n_equal_steps += 1;
 
-        if self.n_equal_steps > self.state.order {
+        if self.state.n_equal_steps > self.state.order {
             let factors = {
                 let order = self.state.order;
                 // similar to the optimal step size factor we calculated above for the current
@@ -1624,8 +1621,9 @@ mod test {
             test_solve_soln_adjoint_with_single_reset_root, test_state_mut,
             test_state_mut_on_problem,
         },
-        scale, ConstantOp, Context, DenseMatrix, FaerLU, FaerMat, FaerSparseLU, FaerSparseMat,
-        MatrixCommon, NalgebraLU, OdeEquations, OdeSolverMethod, Op, Vector, VectorView,
+        scale, BdfState, ConstantOp, Context, DenseMatrix, FaerLU, FaerMat, FaerSparseLU,
+        FaerSparseMat, MatrixCommon, NalgebraLU, NalgebraVec, OdeBuilder, OdeEquations,
+        OdeSolverMethod, Op, Vector, VectorHost, VectorView,
     };
 
     type M = NalgebraMat<f64>;
@@ -1716,6 +1714,71 @@ mod test {
         let solver1 = problem.bdf::<LS>().unwrap();
         let solver2 = problem.bdf::<LS>().unwrap();
         test_checkpointing(soln, solver1, solver2);
+    }
+
+    #[test]
+    fn bdf_checkpoint_restart_preserves_step_growth_state() {
+        let make_problem = || {
+            OdeBuilder::<M>::new()
+                .h0(1e-3)
+                .rtol(1e-6)
+                .atol([1e-8])
+                .p([0.1])
+                .rhs_implicit(
+                    |x: &NalgebraVec<f64>,
+                     p: &NalgebraVec<f64>,
+                     _t: f64,
+                     y: &mut NalgebraVec<f64>| {
+                        y.as_mut_slice()[0] = -p.as_slice()[0] * x.as_slice()[0];
+                    },
+                    |_: &NalgebraVec<f64>,
+                     p: &NalgebraVec<f64>,
+                     _t: f64,
+                     v: &NalgebraVec<f64>,
+                     jv: &mut NalgebraVec<f64>| {
+                        jv.as_mut_slice()[0] = -p.as_slice()[0] * v.as_slice()[0];
+                    },
+                )
+                .init(
+                    |_p: &NalgebraVec<f64>, _t: f64, y: &mut NalgebraVec<f64>| {
+                        y.as_mut_slice()[0] = 100.0;
+                    },
+                    1,
+                )
+                .build()
+                .unwrap()
+        };
+
+        let problem = make_problem();
+        let mut solver = problem.bdf::<LS>().unwrap();
+        while solver.state().t < 10.0 {
+            solver.step().unwrap();
+        }
+        let _ = solver.interpolate(10.0).unwrap();
+        let single_sweep_steps = solver.get_statistics().number_of_steps;
+
+        let mut split_steps = 0;
+        let mut checkpoint: Option<BdfState<NalgebraVec<f64>>> = None;
+        for i in 1..=100 {
+            let target = i as f64 * 0.1;
+            let problem = make_problem();
+            let mut solver = if let Some(state) = checkpoint.take() {
+                problem.bdf_solver::<LS>(state).unwrap()
+            } else {
+                problem.bdf::<LS>().unwrap()
+            };
+            while solver.state().t < target {
+                solver.step().unwrap();
+            }
+            let _ = solver.interpolate(target).unwrap();
+            split_steps += solver.get_statistics().number_of_steps;
+            checkpoint = Some(solver.checkpoint());
+        }
+
+        assert!(
+            split_steps <= single_sweep_steps + 10,
+            "checkpoint/restart should preserve BDF step growth state: split={split_steps}, single={single_sweep_steps}"
+        );
     }
 
     #[test]

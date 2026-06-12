@@ -32,6 +32,7 @@ where
     pub(crate) dsg: Vec<V>,
     pub(crate) t: V::T,
     pub(crate) h: V::T,
+    pub(crate) n_equal_steps: usize,
     pub(crate) diff_initialised: bool,
     pub(crate) sdiff_initialised: bool,
     pub(crate) gdiff_initialised: bool,
@@ -64,6 +65,7 @@ where
             dsg: Vec::new(),
             t: V::T::zero(),
             h: V::T::zero(),
+            n_equal_steps: 0,
             diff_initialised: false,
             sdiff_initialised: false,
             gdiff_initialised: false,
@@ -73,6 +75,7 @@ where
 
     pub fn initialise_diff_to_first_order(&mut self) {
         self.order = 1usize;
+        self.n_equal_steps = 0;
         self.diff.column_mut(0).copy_from(&self.y);
         self.diff.column_mut(1).copy_from(&self.dy);
         self.diff.column_mut(1).mul_assign(scale(self.h));
@@ -211,6 +214,7 @@ where
             dsg,
             t,
             h,
+            n_equal_steps: 0,
             diff_initialised: false,
             sdiff_initialised: false,
             gdiff_initialised: false,
@@ -249,6 +253,7 @@ where
     }
 
     fn as_mut(&mut self) -> StateRefMut<'_, V> {
+        self.n_equal_steps = 0;
         self.diff_initialised = false;
         self.sdiff_initialised = false;
         self.gdiff_initialised = false;
